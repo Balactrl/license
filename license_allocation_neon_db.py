@@ -463,7 +463,7 @@ st.markdown(
     """
 <div class="hero-banner">
     <h1>💎 License Period & Month-Wise Allocator</h1>
-    <p>Upload new batches directly to your Neon Cloud Database and generate month-wise paid site reports.</p>
+    <p>Upload new batches directly to your Cloud Database and generate month-wise paid site reports.</p>
 </div>
 """,
     unsafe_allow_html=True,
@@ -570,7 +570,7 @@ if uploaded_file is not None:
             st.session_state["current_batch_name"] = uploaded_file.name
             st.session_state["last_uploaded_sig"] = file_sig
             st.session_state["upload_success_msg"] = (
-                f"✅ Processed **{len(new_clean)}** rows from `{uploaded_file.name}` and saved to Neon Database!"
+                f"✅ Processed **{len(new_clean)}** rows from `{uploaded_file.name}` and saved to Database!"
             )
             st.rerun()
 
@@ -589,7 +589,7 @@ if not has_master and not has_batch:
         """
     <div style="text-align:center; padding: 3rem; background: white; border-radius: 14px; border: 1px dashed #cbd5e1; color: #64748b;">
         <h4>No Data Available Yet</h4>
-        <p>Upload an Excel or CSV file above to store records in your Neon Cloud Database and view reports.</p>
+        <p>Upload an Excel or CSV file above to store records in your Cloud Database and view reports.</p>
     </div>
     """,
         unsafe_allow_html=True,
