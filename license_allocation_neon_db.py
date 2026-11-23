@@ -397,9 +397,7 @@ with st.sidebar:
         st.session_state["authenticated"] = False
         st.rerun()
 
-    st.success(
-        "**Connected to Neon Cloud DB (High-Speed Cache):**
-"
+    st.success("**Connected to Neon Cloud DB (High-Speed Cache):**"
         "Every uploaded batch is permanently saved to `master_licenses` & `cumulative_master_table`."
     )
 
