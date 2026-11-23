@@ -1,20 +1,21 @@
-import streamlit as st
-import pandas as pd
-import io
-import hmac
-import hashlib
-import json
 from datetime import datetime
+import hashlib
+import hmac
+import io
+import json
+import pandas as pd
 from sqlalchemy import create_engine, text
+import streamlit as st
 
 st.set_page_config(
     page_title="License Allocation Studio",
     page_icon="💎",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-st.markdown("""
+st.markdown(
+    """
 <style>
     .stApp { background-color: #f8fafc; }
     .hero-banner {
@@ -56,7 +57,148 @@ st.markdown("""
         width: 100%;
     }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
+
+
+# --- DATABASE CONNECTION & CACHED SETUP (NEON POSTGRESQL) ---
+@st.cache_resource
+def get_db_engine():
+    db_url = st.secrets.get("database", {}).get("url", "")
+    if not db_url:
+        st.error(
+            "Database URL missing! Add `[database]` `url = 'postgresql://...'` in `.streamlit/secrets.toml`."
+        )
+        st.stop()
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql+psycopg://", 1)
+    elif db_url.startswith("postgresql://"):
+        db_url = db_url.replace("postgresql://", "postgresql+psycopg://", 1)
+    return create_engine(db_url, pool_pre_ping=True, pool_size=5, max_overflow=10)
+
+
+@st.cache_resource
+def init_db():
+    engine = get_db_engine()
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+            CREATE TABLE IF NOT EXISTS master_licenses (
+                id SERIAL PRIMARY KEY,
+                site_id TEXT,
+                row_data TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        )
+        conn.execute(
+            text("""
+            CREATE TABLE IF NOT EXISTS upload_history (
+                file_hash TEXT PRIMARY KEY,
+                file_name TEXT,
+                uploaded_at TEXT
+            )
+        """)
+        )
+    return True
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_master_from_db():
+    engine = get_db_engine()
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("SELECT row_data FROM master_licenses ORDER BY id ASC")
+        )
+        records = [json.loads(r[0]) for r in result]
+    if not records:
+        return pd.DataFrame()
+    return pd.DataFrame(records)
+
+
+def save_batch_to_db(new_clean_df, site_col, file_sig, file_name, existing_raw_df):
+    engine = get_db_engine()
+    records = new_clean_df.to_dict(orient="records")
+    rows_to_insert = []
+    for rec in records:
+        clean_rec = {
+            k: (None if pd.isna(v) else v) for k, v in rec.items()
+        }
+        s_id = str(clean_rec.get(site_col, "")).strip()
+        if s_id.endswith(".0"):
+            s_id = s_id[:-2]
+        rows_to_insert.append(
+            {"site_id": s_id, "row_data": json.dumps(clean_rec, default=str)}
+        )
+
+    # Combine with existing data to update cumulative SQL table in one shot
+    if existing_raw_df is not None and not existing_raw_df.empty:
+        combined_df = pd.concat([existing_raw_df, new_clean_df], ignore_index=True)
+    else:
+        combined_df = new_clean_df.copy()
+    combined_sorted, _, _ = sort_columns(combined_df)
+
+    with engine.begin() as conn:
+        # Bulk insert all rows in a single round-trip
+        if rows_to_insert:
+            conn.execute(
+                text(
+                    "INSERT INTO master_licenses (site_id, row_data) VALUES (:site_id, :row_data)"
+                ),
+                rows_to_insert,
+            )
+        conn.execute(
+            text("""
+                INSERT INTO upload_history (file_hash, file_name, uploaded_at)
+                VALUES (:h, :f, :t)
+                ON CONFLICT (file_hash) DO NOTHING
+            """),
+            {
+                "h": file_sig,
+                "f": file_name,
+                "t": datetime.now().isoformat(timespec="seconds"),
+            },
+        )
+        combined_sorted.to_sql(
+            "cumulative_master_table",
+            con=conn,
+            if_exists="replace",
+            index=False,
+        )
+
+    load_master_from_db.clear()
+
+
+def is_file_uploaded_in_db(file_sig):
+    engine = get_db_engine()
+    with engine.connect() as conn:
+        res = conn.execute(
+            text("SELECT 1 FROM upload_history WHERE file_hash = :h"),
+            {"h": file_sig},
+        ).fetchone()
+    return res is not None
+
+
+def get_existing_site_ids_from_db():
+    engine = get_db_engine()
+    with engine.connect() as conn:
+        res = conn.execute(
+            text(
+                "SELECT DISTINCT site_id FROM master_licenses WHERE site_id IS NOT NULL AND site_id != ''"
+            )
+        )
+        return {str(r[0]).strip() for r in res}
+
+
+def clear_db():
+    engine = get_db_engine()
+    with engine.begin() as conn:
+        conn.execute(text("TRUNCATE TABLE master_licenses RESTART IDENTITY"))
+        conn.execute(text("TRUNCATE TABLE upload_history"))
+        conn.execute(text("DROP TABLE IF EXISTS cumulative_master_table"))
+    load_master_from_db.clear()
+
 
 # --- HELPER FUNCTIONS ---
 def parse_period(period_str):
@@ -64,6 +206,7 @@ def parse_period(period_str):
     start_dt = pd.to_datetime(start_str.strip(), dayfirst=True)
     end_dt = pd.to_datetime(end_str.strip(), dayfirst=True)
     return pd.Series((start_dt, end_dt))
+
 
 def normalize_header(col):
     if isinstance(col, (datetime, pd.Timestamp)):
@@ -80,12 +223,14 @@ def normalize_header(col):
     except ValueError:
         return s
 
+
 def is_month_col(col_name):
     try:
         datetime.strptime(str(col_name).strip(), "%b-%y")
         return True
     except ValueError:
         return False
+
 
 def sort_columns(df):
     df = df.copy()
@@ -95,30 +240,42 @@ def sort_columns(df):
 
     month_cols = sorted(
         [c for c in df.columns if is_month_col(c)],
-        key=lambda x: datetime.strptime(x, "%b-%y")
+        key=lambda x: datetime.strptime(x, "%b-%y"),
     )
     base_cols = [c for c in df.columns if c not in month_cols]
     for m in month_cols:
         df[m] = pd.to_numeric(df[m], errors="coerce").fillna(0.0).round(2)
     if "LIESENCE AMOUNT" in df.columns:
-        df["LIESENCE AMOUNT"] = pd.to_numeric(df["LIESENCE AMOUNT"], errors="coerce").fillna(0.0).round(2)
+        df["LIESENCE AMOUNT"] = (
+            pd.to_numeric(df["LIESENCE AMOUNT"], errors="coerce")
+            .fillna(0.0)
+            .round(2)
+        )
     if "PER DAY" in df.columns:
-        df["PER DAY"] = pd.to_numeric(df["PER DAY"], errors="coerce").fillna(0.0).round(6)
+        df["PER DAY"] = (
+            pd.to_numeric(df["PER DAY"], errors="coerce").fillna(0.0).round(6)
+        )
     return df[base_cols + month_cols], base_cols, month_cols
 
+
+@st.cache_data(show_spinner=False)
 def to_excel_bytes(dataframe, sheet_name):
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         dataframe.to_excel(writer, index=False, sheet_name=sheet_name)
     return buffer.getvalue()
 
+
 def find_column(columns, target):
-    target_clean = "".join(char for char in str(target).upper() if char.isalnum())
+    target_clean = "".join(
+        char for char in str(target).upper() if char.isalnum()
+    )
     for col in columns:
         cleaned = "".join(char for char in str(col).upper() if char.isalnum())
         if cleaned == target_clean:
             return col
     return None
+
 
 def find_site_column(columns):
     for name in ("SITEID", "SITECODE", "ID"):
@@ -127,108 +284,21 @@ def find_site_column(columns):
             return column
     return next(iter(columns))
 
+
 def text_column_matches(dataframe, column, search_text):
-    values = dataframe[column].astype("string").fillna("").str.replace(
-        r"\.0$", "", regex=True
+    values = (
+        dataframe[column]
+        .astype("string")
+        .fillna("")
+        .str.replace(r"\.0$", "", regex=True)
     )
     return values.str.contains(search_text, case=False, regex=False, na=False)
 
-# --- DATABASE CONNECTION & SETUP (NEON POSTGRESQL) ---
-@st.cache_resource
-def get_db_engine():
-    db_url = st.secrets.get("database", {}).get("url", "")
-    if not db_url:
-        st.error("Database URL missing! Add `[database]` `url = 'postgresql://...'` in `.streamlit/secrets.toml`.")
-        st.stop()
-    if db_url.startswith("postgres://"):
-        db_url = db_url.replace("postgres://", "postgresql://", 1)
-    return create_engine(db_url, pool_pre_ping=True)
-
-def init_db():
-    engine = get_db_engine()
-    with engine.begin() as conn:
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS master_licenses (
-                id SERIAL PRIMARY KEY,
-                site_id TEXT,
-                row_data TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS upload_history (
-                file_hash TEXT PRIMARY KEY,
-                file_name TEXT,
-                uploaded_at TEXT
-            )
-        """))
-
-def load_master_from_db():
-    engine = get_db_engine()
-    with engine.connect() as conn:
-        result = conn.execute(text("SELECT row_data FROM master_licenses ORDER BY id ASC"))
-        records = [json.loads(r[0]) for r in result]
-    if not records:
-        return pd.DataFrame()
-    return pd.DataFrame(records)
-
-def sync_cumulative_table(engine):
-    with engine.connect() as conn:
-        result = conn.execute(text("SELECT row_data FROM master_licenses ORDER BY id ASC"))
-        records = [json.loads(r[0]) for r in result]
-    if records:
-        full_df = pd.DataFrame(records)
-        sorted_df, _, _ = sort_columns(full_df)
-        sorted_df.to_sql("cumulative_master_table", engine, if_exists="replace", index=False)
-
-def save_batch_to_db(new_clean_df, site_col, file_sig, file_name):
-    engine = get_db_engine()
-    records = new_clean_df.to_dict(orient="records")
-    with engine.begin() as conn:
-        for rec in records:
-            clean_rec = {k: (None if pd.isna(v) else v) for k, v in rec.items()}
-            s_id = str(clean_rec.get(site_col, "")).strip()
-            if s_id.endswith(".0"):
-                s_id = s_id[:-2]
-            conn.execute(
-                text("INSERT INTO master_licenses (site_id, row_data) VALUES (:site_id, :row_data)"),
-                {"site_id": s_id, "row_data": json.dumps(clean_rec, default=str)}
-            )
-        conn.execute(
-            text("""
-                INSERT INTO upload_history (file_hash, file_name, uploaded_at)
-                VALUES (:h, :f, :t)
-                ON CONFLICT (file_hash) DO NOTHING
-            """),
-            {"h": file_sig, "f": file_name, "t": datetime.now().isoformat(timespec="seconds")}
-        )
-    sync_cumulative_table(engine)
-
-def is_file_uploaded_in_db(file_sig):
-    engine = get_db_engine()
-    with engine.connect() as conn:
-        res = conn.execute(
-            text("SELECT 1 FROM upload_history WHERE file_hash = :h"),
-            {"h": file_sig}
-        ).fetchone()
-    return res is not None
-
-def get_existing_site_ids_from_db():
-    engine = get_db_engine()
-    with engine.connect() as conn:
-        res = conn.execute(text("SELECT DISTINCT site_id FROM master_licenses WHERE site_id IS NOT NULL AND site_id != ''"))
-        return {str(r[0]).strip() for r in res}
-
-def clear_db():
-    engine = get_db_engine()
-    with engine.begin() as conn:
-        conn.execute(text("TRUNCATE TABLE master_licenses RESTART IDENTITY"))
-        conn.execute(text("TRUNCATE TABLE upload_history"))
-        conn.execute(text("DROP TABLE IF EXISTS cumulative_master_table"))
 
 # --- LOGIN PAGE ---
 def show_login_page():
-    st.markdown("""
+    st.markdown(
+        """
     <style>
         .stApp {
             background:
@@ -256,16 +326,21 @@ def show_login_page():
             border: 0;
         }
     </style>
-    """, unsafe_allow_html=True)
+    """,
+        unsafe_allow_html=True,
+    )
     _, login_column, _ = st.columns([1, 1.15, 1])
     with login_column:
-        st.markdown("""
+        st.markdown(
+            """
         <div class="login-brand">
             <div class="login-mark">💎</div>
             <h1>Welcome back</h1>
             <p>Sign in to License Period Allocation</p>
         </div>
-        """, unsafe_allow_html=True)
+        """,
+            unsafe_allow_html=True,
+        )
         with st.form("login_form"):
             username = st.text_input("Username", placeholder="Enter your username")
             password = st.text_input(
@@ -294,21 +369,27 @@ def show_login_page():
             else:
                 st.error("Incorrect username or password.")
 
+
 if not st.session_state.get("authenticated", False):
     show_login_page()
     st.stop()
 
-# Initialize Neon PostgreSQL Database Tables & Sync Cumulative Table
+# Initialize Neon PostgreSQL Database Tables (Cached once per server startup)
 try:
     init_db()
-    sync_cumulative_table(get_db_engine())
 except Exception as db_err:
     st.error(f"Database Connection Error: {db_err}")
     st.stop()
 
-# Load Master Data from Database
+# Load Master Data from Cached DB Query (Instant after first load)
 raw_master = load_master_from_db()
 has_master = not raw_master.empty
+master_df = pd.DataFrame()
+m_base_cols = []
+m_month_cols = []
+
+if has_master:
+    master_df, m_base_cols, m_month_cols = sort_columns(raw_master)
 
 with st.sidebar:
     st.markdown("### ⚙️ Control Panel")
@@ -317,32 +398,62 @@ with st.sidebar:
         st.rerun()
 
     st.success(
-        "**Connected to Neon Cloud DB:**\n"
-        "Every uploaded batch is permanently saved to `master_licenses` and "
-        "`cumulative_master_table` (with all month columns) in PostgreSQL."
+        "**Connected to Neon Cloud DB (High-Speed Cache):**
+"
+        "Every uploaded batch is permanently saved to `master_licenses` & `cumulative_master_table`."
     )
 
     st.markdown("#### 📄 Sample Template")
     sample_df = pd.DataFrame(
         [
-            ("10001", "BNG", "KA", "192012-RF004320122190", "FA20-21", "01-04-2024 TO 01-04-2026", 3000),
-            ("10002", "KAR", "TN", "192-RB04320122190", "FA20-2F", "01-04-2024 TO 01-04-2027", 5000),
+            (
+                "10001",
+                "BNG",
+                "KA",
+                "192012-RF004320122190",
+                "FA20-21",
+                "01-04-2024 TO 01-04-2026",
+                3000,
+            ),
+            (
+                "10002",
+                "KAR",
+                "TN",
+                "192-RB04320122190",
+                "FA20-2F",
+                "01-04-2024 TO 01-04-2027",
+                5000,
+            ),
         ],
-        columns=("SITEID", "SITENAME", "REGION", "DLNO", "FSSAI", "PERIOD DATE", "LIESENCE AMOUNT")
+        columns=(
+            "SITEID",
+            "SITENAME",
+            "REGION",
+            "DLNO",
+            "FSSAI",
+            "PERIOD DATE",
+            "LIESENCE AMOUNT",
+        ),
     )
-    st.download_button("⬇️ Download Sample Excel", to_excel_bytes(sample_df, "Sample"), "Sample_License_Input.xlsx")
+    st.download_button(
+        "⬇️ Download Sample Excel",
+        to_excel_bytes(sample_df, "Sample"),
+        "Sample_License_Input.xlsx",
+    )
 
     if has_master:
         st.markdown("---")
         st.markdown("#### 🗄️ Master Database Export")
-        sorted_sidebar_master, _, _ = sort_columns(raw_master)
-        st.caption(f"Total Saved Records: **{len(sorted_sidebar_master):,}**")
+        st.caption(f"Total Saved Records: **{len(master_df):,}**")
         st.download_button(
             "⬇️ Download Master Excel",
-            to_excel_bytes(sorted_sidebar_master, "Master_All_Data"),
+            to_excel_bytes(master_df, "Master_All_Data"),
             file_name="Master_License_Database.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+        if st.button("🔄 Refresh DB Cache"):
+            load_master_from_db.clear()
+            st.rerun()
         if st.button("🗑️ Clear Cloud Database"):
             clear_db()
             st.session_state.pop("last_uploaded_sig", None)
@@ -350,133 +461,160 @@ with st.sidebar:
             st.session_state.pop("current_batch_name", None)
             st.rerun()
 
-st.markdown("""
+st.markdown(
+    """
 <div class="hero-banner">
     <h1>💎 License Period & Month-Wise Allocator</h1>
-    <p>Upload new batches directly to your Cloud Database and generate month-wise paid site reports.</p>
+    <p>Upload new batches directly to your Neon Cloud Database and generate month-wise paid site reports.</p>
 </div>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-uploaded_file = st.file_uploader("📂 Upload New Batch (Excel or CSV)", type=("xlsx", "xls", "csv"))
+uploaded_file = st.file_uploader(
+    "📂 Upload New Batch (Excel or CSV)", type=("xlsx", "xls", "csv")
+)
 
 if uploaded_file is not None:
     uploaded_bytes = uploaded_file.getvalue()
     file_sig = hashlib.sha256(uploaded_bytes).hexdigest()
 
     if st.session_state.get("last_uploaded_sig") != file_sig:
-        if is_file_uploaded_in_db(file_sig):
-            st.session_state["duplicate_upload_warning"] = (
-                "Please check: this exact file has already been uploaded to the database. It was not added again."
+        with st.spinner("Processing and saving to Neon Database..."):
+            if is_file_uploaded_in_db(file_sig):
+                st.session_state["duplicate_upload_warning"] = (
+                    "Please check: this exact file has already been uploaded to the database. It was not added again."
+                )
+                st.session_state["last_uploaded_sig"] = file_sig
+                st.rerun()
+
+            uploaded_buffer = io.BytesIO(uploaded_bytes)
+            new_df = (
+                pd.read_csv(uploaded_buffer)
+                if uploaded_file.name.lower().endswith(".csv")
+                else pd.read_excel(uploaded_buffer)
             )
+            new_df.columns = [str(c).strip() for c in new_df.columns]
+
+            if (
+                "PERIOD DATE" not in new_df.columns
+                or "LIESENCE AMOUNT" not in new_df.columns
+            ):
+                st.error(
+                    "Missing required columns: `PERIOD DATE` and `LIESENCE AMOUNT`."
+                )
+                st.stop()
+
+            site_column = find_site_column(new_df.columns)
+            site_ids = (
+                new_df[site_column]
+                .astype("string")
+                .fillna("")
+                .str.strip()
+                .str.replace(r"\.0$", "", regex=True)
+            )
+
+            # 1. Check duplicates within the uploaded file
+            duplicate_site_ids = site_ids[
+                site_ids.ne("") & site_ids.duplicated(keep=False)
+            ].drop_duplicates()
+            if not duplicate_site_ids.empty:
+                duplicate_list = ", ".join(duplicate_site_ids.head(10).tolist())
+                st.error(
+                    "Duplicate Site ID(s) found inside this file. Please check before "
+                    f"uploading: {duplicate_list}"
+                )
+                st.stop()
+
+            # 2. Check duplicates against existing Neon Database records
+            existing_db_sites = get_existing_site_ids_from_db()
+            cross_duplicates = [
+                sid for sid in site_ids if sid and sid in existing_db_sites
+            ]
+            if cross_duplicates:
+                dup_str = ", ".join(list(dict.fromkeys(cross_duplicates))[:10])
+                st.error(
+                    f"These Site ID(s) already exist in the Master Database: {dup_str}. "
+                    "Remove duplicate sites before uploading."
+                )
+                st.stop()
+
+            new_df[["_start", "_end"]] = new_df["PERIOD DATE"].apply(parse_period)
+            new_df["DAYS"] = (new_df["_end"] - new_df["_start"]).dt.days + 1
+            new_df["PER DAY"] = (new_df["LIESENCE AMOUNT"] / new_df["DAYS"]).round(6)
+            new_df["UPLOADED AT"] = datetime.now().strftime("%d-%m-%Y %I:%M %p")
+
+            min_m = new_df["_start"].min().to_period("M")
+            max_m = new_df["_end"].max().to_period("M")
+            batch_months = pd.period_range(start=min_m, end=max_m, freq="M")
+
+            for period in batch_months:
+                col_name = period.strftime("%b-%y")
+                m_start = period.to_timestamp()
+                m_end = period.to_timestamp(how="end").normalize()
+
+                a_start = new_df["_start"].clip(lower=m_start)
+                a_end = new_df["_end"].clip(upper=m_end)
+                d_count = ((a_end - a_start).dt.days + 1).clip(lower=0)
+                new_df[col_name] = (
+                    d_count * (new_df["LIESENCE AMOUNT"] / new_df["DAYS"])
+                ).round(2)
+
+            new_clean = new_df.drop(columns=["_start", "_end"])
+            new_clean, _, _ = sort_columns(new_clean)
+
+            # Bulk save batch & update cumulative_master_table
+            save_batch_to_db(
+                new_clean, site_column, file_sig, uploaded_file.name, raw_master
+            )
+
+            st.session_state["current_batch_df"] = new_clean.copy()
+            st.session_state["current_batch_name"] = uploaded_file.name
             st.session_state["last_uploaded_sig"] = file_sig
+            st.session_state["upload_success_msg"] = (
+                f"✅ Processed **{len(new_clean)}** rows from `{uploaded_file.name}` and saved to Neon Database!"
+            )
             st.rerun()
 
-        uploaded_buffer = io.BytesIO(uploaded_bytes)
-        new_df = (
-            pd.read_csv(uploaded_buffer)
-            if uploaded_file.name.lower().endswith(".csv")
-            else pd.read_excel(uploaded_buffer)
-        )
-        new_df.columns = [str(c).strip() for c in new_df.columns]
-
-        if "PERIOD DATE" not in new_df.columns or "LIESENCE AMOUNT" not in new_df.columns:
-            st.error("Missing required columns: `PERIOD DATE` and `LIESENCE AMOUNT`.")
-            st.stop()
-
-        site_column = find_site_column(new_df.columns)
-        site_ids = (
-            new_df[site_column]
-            .astype("string")
-            .fillna("")
-            .str.strip()
-            .str.replace(r"\.0$", "", regex=True)
-        )
-
-        # 1. Check duplicates within the uploaded file
-        duplicate_site_ids = site_ids[
-            site_ids.ne("") & site_ids.duplicated(keep=False)
-        ].drop_duplicates()
-        if not duplicate_site_ids.empty:
-            duplicate_list = ", ".join(duplicate_site_ids.head(10).tolist())
-            st.error(
-                "Duplicate Site ID(s) found inside this file. Please check before "
-                f"uploading: {duplicate_list}"
-            )
-            st.stop()
-
-        # 2. Check duplicates against existing Neon Database records
-        existing_db_sites = get_existing_site_ids_from_db()
-        cross_duplicates = [sid for sid in site_ids if sid and sid in existing_db_sites]
-        if cross_duplicates:
-            dup_str = ", ".join(list(dict.fromkeys(cross_duplicates))[:10])
-            st.error(
-                f"These Site ID(s) already exist in the Master Database: {dup_str}. "
-                "Remove duplicate sites before uploading."
-            )
-            st.stop()
-
-        new_df[["_start", "_end"]] = new_df["PERIOD DATE"].apply(parse_period)
-        new_df["DAYS"] = (new_df["_end"] - new_df["_start"]).dt.days + 1
-        new_df["PER DAY"] = (new_df["LIESENCE AMOUNT"] / new_df["DAYS"]).round(6)
-        new_df["UPLOADED AT"] = datetime.now().strftime("%d-%m-%Y %I:%M %p")
-
-        min_m = new_df["_start"].min().to_period("M")
-        max_m = new_df["_end"].max().to_period("M")
-        batch_months = pd.period_range(start=min_m, end=max_m, freq="M")
-
-        for period in batch_months:
-            col_name = period.strftime("%b-%y")
-            m_start = period.to_timestamp()
-            m_end = period.to_timestamp(how="end").normalize()
-
-            a_start = new_df["_start"].clip(lower=m_start)
-            a_end = new_df["_end"].clip(upper=m_end)
-            d_count = ((a_end - a_start).dt.days + 1).clip(lower=0)
-            new_df[col_name] = (d_count * (new_df["LIESENCE AMOUNT"] / new_df["DAYS"])).round(2)
-
-        new_clean = new_df.drop(columns=["_start", "_end"])
-        new_clean, _, _ = sort_columns(new_clean)
-
-        # Save batch directly to Neon PostgreSQL Database & update cumulative_master_table
-        save_batch_to_db(new_clean, site_column, file_sig, uploaded_file.name)
-
-        st.session_state["current_batch_df"] = new_clean.copy()
-        st.session_state["current_batch_name"] = uploaded_file.name
-        st.session_state["last_uploaded_sig"] = file_sig
-        st.success(f"✅ Processed **{len(new_clean)}** rows from `{uploaded_file.name}` and saved permanently to Database!")
-        st.rerun()
+upload_success_msg = st.session_state.pop("upload_success_msg", None)
+if upload_success_msg:
+    st.success(upload_success_msg)
 
 duplicate_upload_warning = st.session_state.pop("duplicate_upload_warning", None)
 if duplicate_upload_warning:
     st.warning(duplicate_upload_warning)
 
-# Reload fresh master data from DB
-raw_master = load_master_from_db()
-has_master = not raw_master.empty
 has_batch = "current_batch_df" in st.session_state
 
 if not has_master and not has_batch:
-    st.markdown("""
+    st.markdown(
+        """
     <div style="text-align:center; padding: 3rem; background: white; border-radius: 14px; border: 1px dashed #cbd5e1; color: #64748b;">
         <h4>No Data Available Yet</h4>
-        <p>Upload an Excel or CSV file above to store records in your  Cloud Database and view reports.</p>
+        <p>Upload an Excel or CSV file above to store records in your Neon Cloud Database and view reports.</p>
     </div>
-    """, unsafe_allow_html=True)
+    """,
+        unsafe_allow_html=True,
+    )
     st.stop()
 
-master_df = pd.DataFrame()
-m_base_cols = []
-m_month_cols = []
-
 if has_master:
-    master_df, m_base_cols, m_month_cols = sort_columns(raw_master)
     first_m = next(iter(m_month_cols), "N/A")
     last_m = next(reversed(m_month_cols), "N/A")
 
     k1, k2, k3 = st.columns(3)
-    k1.markdown(f'<div class="kpi-card"><div class="kpi-label">Cumulative Master Sites</div><div class="kpi-value">{len(master_df):,}</div><div class="kpi-sub">✓ Stored in Neon Cloud DB</div></div>', unsafe_allow_html=True)
-    k2.markdown(f'<div class="kpi-card"><div class="kpi-label">Cumulative License Amount</div><div class="kpi-value">{pd.to_numeric(master_df["LIESENCE AMOUNT"], errors="coerce").sum():,.2f}</div><div class="kpi-sub">100% Allocated</div></div>', unsafe_allow_html=True)
-    k3.markdown(f'<div class="kpi-card"><div class="kpi-label">Master Timeline</div><div class="kpi-value" style="font-size:1.35rem;padding-top:0.3rem;">{first_m} → {last_m}</div><div class="kpi-sub">{len(m_month_cols)} Calendar Months</div></div>', unsafe_allow_html=True)
+    k1.markdown(
+        f'<div class="kpi-card"><div class="kpi-label">Cumulative Master Sites</div><div class="kpi-value">{len(master_df):,}</div><div class="kpi-sub">✓ Stored in Neon Cloud DB</div></div>',
+        unsafe_allow_html=True,
+    )
+    k2.markdown(
+        f'<div class="kpi-card"><div class="kpi-label">Cumulative License Amount</div><div class="kpi-value">{pd.to_numeric(master_df["LIESENCE AMOUNT"], errors="coerce").sum():,.2f}</div><div class="kpi-sub">100% Allocated</div></div>',
+        unsafe_allow_html=True,
+    )
+    k3.markdown(
+        f'<div class="kpi-card"><div class="kpi-label">Master Timeline</div><div class="kpi-value" style="font-size:1.35rem;padding-top:0.3rem;">{first_m} → {last_m}</div><div class="kpi-sub">{len(m_month_cols)} Calendar Months</div></div>',
+        unsafe_allow_html=True,
+    )
     st.markdown("<br>", unsafe_allow_html=True)
 
 selected_view = st.radio(
@@ -484,10 +622,10 @@ selected_view = st.radio(
     (
         "📤 1. Current Uploaded File",
         "📋 2. Cumulative Master Data (All Sites)",
-        "🎯 3. Month-Wise Site Report"
+        "🎯 3. Month-Wise Site Report",
     ),
     horizontal=True,
-    label_visibility="collapsed"
+    label_visibility="collapsed",
 )
 st.markdown("---")
 
@@ -504,12 +642,16 @@ if selected_view == "📤 1. Current Uploaded File":
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     else:
-        st.info("Upload a file above to view the current batch. Your cumulative master data from the database is available in Option 2.")
+        st.info(
+            "Upload a file above to view the current batch. Your cumulative master data from the database is available in Option 2."
+        )
 
 elif selected_view == "📋 2. Cumulative Master Data (All Sites)":
     if has_master and not master_df.empty:
         st.subheader("Cumulative Master Data (All Sites)")
-        st.caption(f"{len(master_df):,} records stored permanently in Neon PostgreSQL (`cumulative_master_table`)")
+        st.caption(
+            f"{len(master_df):,} records stored permanently in Neon PostgreSQL (`cumulative_master_table`)"
+        )
         st.dataframe(master_df, width="stretch", hide_index=True)
         st.download_button(
             "⬇️ Download Cumulative Master Data (Excel)",
@@ -518,12 +660,16 @@ elif selected_view == "📋 2. Cumulative Master Data (All Sites)":
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     else:
-        st.info("No cumulative master records are available yet. Upload a file above to build the master database.")
+        st.info(
+            "No cumulative master records are available yet. Upload a file above to build the master database."
+        )
 
 elif selected_view == "🎯 3. Month-Wise Site Report":
     if has_master and not master_df.empty and m_month_cols:
         st.subheader("Month-Wise Site Report")
-        st.caption("Choose a month, date range, Site ID, DLNO, or FSSAI. Any one filter can be used by itself.")
+        st.caption(
+            "Choose a month, date range, Site ID, DLNO, or FSSAI. Any one filter can be used by itself."
+        )
         selected_month = st.selectbox(
             "Select month",
             m_month_cols,
@@ -568,7 +714,11 @@ elif selected_view == "🎯 3. Month-Wise Site Report":
 
         has_date_filter = from_date is not None or to_date is not None
         has_search_filter = bool(
-            selected_month or has_date_filter or site_search or dlno_search or fssai_search
+            selected_month
+            or has_date_filter
+            or site_search
+            or dlno_search
+            or fssai_search
         )
         requested_searches = {
             "Site ID": site_search,
@@ -619,7 +769,9 @@ elif selected_view == "🎯 3. Month-Wise Site Report":
 
             if selected_month:
                 report_months = [selected_month]
-                month_amounts = pd.to_numeric(master_df[selected_month], errors="coerce").fillna(0)
+                month_amounts = pd.to_numeric(
+                    master_df[selected_month], errors="coerce"
+                ).fillna(0)
                 date_matches &= month_amounts > 0
             else:
                 report_months = list(m_month_cols)
@@ -627,16 +779,20 @@ elif selected_view == "🎯 3. Month-Wise Site Report":
                     report_months = []
                     for month in m_month_cols:
                         month_start = datetime.strptime(month, "%b-%y").date()
-                        month_end = (pd.Timestamp(month_start) + pd.offsets.MonthEnd(0)).date()
-                        if (
-                            (from_date is None or month_end >= from_date)
-                            and (to_date is None or month_start <= to_date)
+                        month_end = (
+                            pd.Timestamp(month_start) + pd.offsets.MonthEnd(0)
+                        ).date()
+                        if (from_date is None or month_end >= from_date) and (
+                            to_date is None or month_start <= to_date
                         ):
                             report_months.append(month)
                     if report_months:
-                        range_amounts = master_df[report_months].apply(
-                            pd.to_numeric, errors="coerce"
-                        ).fillna(0).sum(axis=1)
+                        range_amounts = (
+                            master_df[report_months]
+                            .apply(pd.to_numeric, errors="coerce")
+                            .fillna(0)
+                            .sum(axis=1)
+                        )
                         date_matches &= range_amounts > 0
                     else:
                         date_matches &= False
@@ -646,11 +802,15 @@ elif selected_view == "🎯 3. Month-Wise Site Report":
                 m_base_cols + report_months,
             ].copy()
             if selected_month and not report_data.empty:
-                report_data = report_data.sort_values(selected_month, ascending=False)
+                report_data = report_data.sort_values(
+                    selected_month, ascending=False
+                )
 
             if not report_data.empty:
                 result_bounds = report_data["PERIOD DATE"].apply(parse_period)
-                report_data["FROM DATE"] = result_bounds[0].dt.strftime("%d-%m-%Y")
+                report_data["FROM DATE"] = result_bounds[0].dt.strftime(
+                    "%d-%m-%Y"
+                )
                 report_data["TO DATE"] = result_bounds[1].dt.strftime("%d-%m-%Y")
                 report_columns = []
                 for column in m_base_cols:
@@ -669,7 +829,8 @@ elif selected_view == "🎯 3. Month-Wise Site Report":
                 .fillna(0)
                 .sum()
                 .sum()
-                if not report_data.empty else 0
+                if not report_data.empty
+                else 0
             )
             metric_col2.metric(
                 "Total allocated",
@@ -688,6 +849,10 @@ elif selected_view == "🎯 3. Month-Wise Site Report":
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
         else:
-            st.info("Select a month, choose a date, or enter a Site ID, DLNO, or FSSAI to display a report.")
+            st.info(
+                "Select a month, choose a date, or enter a Site ID, DLNO, or FSSAI to display a report."
+            )
     else:
-        st.info("No monthly allocation data is available yet. Upload a file with valid PERIOD DATE and LIESENCE AMOUNT values.")
+        st.info(
+            "No monthly allocation data is available yet. Upload a file with valid PERIOD DATE and LIESENCE AMOUNT values."
+        )
